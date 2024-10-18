@@ -41,36 +41,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
-
-
-class SambaRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
-        )
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def forward(self):
-        # TODO
-        pass
+from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+                                              AttentionMetadata, AttentionType)
 
 
 class SambaMLP(nn.Module):
@@ -101,7 +73,7 @@ class SambaMLP(nn.Module):
 class SambaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config, layer_idx: Optional[int] = None, yoco_cross: bool = False):
+    def __init__(self, config, layer_idx: Optional[int] = None, yoco_cross: bool = False, cache_config: Optional[CacheConfig] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -135,16 +107,41 @@ class SambaAttention(nn.Module):
             self.Wqkv =  nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         else:
             self.Wqkv = nn.Linear(self.hidden_size, op_size, bias=False)
-        
-        self.rotary_emb = SambaRotaryEmbedding(
+
+        self.rotary_emb = get_rope(
             self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
             base=self.rope_theta,
         )
+        # TODO: add sliding window
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.head_dim**-0.5,
+            num_kv_heads=self.num_key_value_heads,
+            cache_config=cache_config,
+        )
 
-    def forward(self):
-        # TODO
-        assert False
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            kv_cache: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+        ):
+        if not self.yoco_cross:
+            qkv = self.Wqkv(hidden_states)
+            q, k, v = qkv.split([self.hidden_size, self.num_key_value_heads * self.head_dim, self.num_key_value_heads * self.head_dim], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        else:
+            q = self.Wqkv(hidden_states)
+            mock_k = torch.zeros_like(q)
+            q, _ = self.rotary_emb(positions, q, mock_k)
+            print('>>>', attn_metadata.is_all_encoder_attn_metadata_set, attn_metadata.is_all_cross_attn_metadata_set)
+            attn_output = self.attn(q, None, None, kv_cache, attn_metadata, attn_type=AttentionType.ENCODER_DECODER)
+        return self.out_proj(attn_output)
 
 
 class Phi3Mamba(nn.Module):
@@ -352,7 +349,7 @@ class Phi3Mamba(nn.Module):
 
 class SambaDecoderLayer(nn.Module):
     
-    def __init__(self, config, layer_idx) -> None:
+    def __init__(self, config, layer_idx, cache_config) -> None:
         super().__init__()
     
         self.config = config
@@ -374,7 +371,7 @@ class SambaDecoderLayer(nn.Module):
             factory_kwargs = {"dtype": torch.float32}
             self.attn = Phi3Mamba(config.hidden_size, layer_idx=layer_idx, **factory_kwargs)
         else:
-            self.attn = SambaAttention(config, layer_idx=layer_idx, yoco_cross=self.yoco_cross)
+            self.attn = SambaAttention(config, layer_idx=layer_idx, yoco_cross=self.yoco_cross, cache_config=cache_config)
 
         self.resid_attn_dropout = nn.Dropout(config.resid_pdrop)
         self.resid_mlp_dropout = nn.Dropout(config.resid_pdrop)
@@ -439,7 +436,7 @@ class SambaModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
         self.layers = nn.ModuleList(
-            [SambaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [SambaDecoderLayer(config, layer_idx, cache_config) for layer_idx in range(config.num_hidden_layers)]
         )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         # TODO
@@ -452,13 +449,11 @@ class SambaModel(nn.Module):
         attn_metadata: AttentionMetadata,
         mamba_cache_params: MambaCacheParams,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        print('>>>', input_ids.shape, input_ids)
-        print('>>>', positions.shape, positions, positions[:100])
         hidden_states = self.embed_tokens(input_ids)
-        print('>>>', hidden_states.shape)
         residual = None
 
-        is_prefill = attn_metadata.prefill_metadata.block_tables.numel() == 0
+        print('>>>', attn_metadata)
+        is_prefill = attn_metadata.max_decode_seq_len == 0
         print('>>>', is_prefill)
 
         kv_cache_idx = 0
@@ -499,8 +494,7 @@ class SambaModel(nn.Module):
                     None,
                 )
 
-        hidden_states, _ = self.final_layernorm(hidden_states)
-        assert False
+        hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
 
@@ -517,9 +511,25 @@ class SambaForCausalLM(nn.Module, HasInnerState):
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = SambaModel(config)
+        self.model = SambaModel(config, cache_config=cache_config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
+        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
+        self.unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.lm_head = ParallelLMHead(
+            self.unpadded_vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            padding_size=(
+                DEFAULT_VOCAB_PADDING_SIZE
+                # We need bigger padding if using lora for kernel
+                # compatibility
+                if not lora_config else
+                lora_config.lora_vocab_padding_size),
+            quant_config=quant_config,
+        )
+        self.embedding_bias = nn.Parameter(torch.zeros(config.vocab_size))
 
         self.mamba_cache: Optional[MambaCacheManager] = None
         self.logits_processor = LogitsProcessor(config.vocab_size,
@@ -556,10 +566,28 @@ class SambaForCausalLM(nn.Module, HasInnerState):
                                               mamba_cache_tensors[1],
                                               state_indices_tensor)
 
-        # print(mamba_cache[0].shape, mamba_cache[1].shape)
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, mamba_cache_params)
         return hidden_states
+
+    def _get_mamba_cache_shape(
+            self
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+        world_size = get_tensor_model_parallel_world_size()
+        hidden_size = self.config.hidden_size
+        # TODO: use hard-coded values for now
+        mamba_expand = 2
+        mamba_d_conv = 4
+        mamba_d_state = 16
+        conv_state_shape = (
+            mamba_expand * hidden_size // world_size,
+            mamba_d_conv - 1,
+        )
+        temporal_state_shape = (
+            mamba_expand * hidden_size // world_size,
+            mamba_d_state,
+        )
+        return conv_state_shape, temporal_state_shape
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.mamba_cache.copy_inputs_before_cuda_graphs(
@@ -573,16 +601,33 @@ class SambaForCausalLM(nn.Module, HasInnerState):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        # TODO
-        pass
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata, self.embedding_bias)
+        return logits
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        # TODO
-        pass
+        next_tokens = self.sampler(logits, sampling_metadata)
+        return next_tokens
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+    ):
+        weights = {name: weight for name, weight in weights}
+        # for name, loaded_weight in weights.items():
+        #     print(name, loaded_weight.shape)
+
+        # for name, param in self.named_parameters():
+        #     print(name, param.shape)
+        missing_keys, unexpected_keys = self.load_state_dict(weights, strict=False)
+        assert missing_keys == ['embedding_bias', 'lm_head.weight',], f"Missing keys: {missing_keys}"
+        # assert not unexpected_keys, f"Unexpected keys: {unexpected_keys}"
+        self.lm_head.weight.data.copy_(weights['model.embed_tokens.weight'])
+        self.embedding_bias.data.copy_(weights['lm_head.bias'])
 
     def _swap_mamba_cache(self, from_index: int, to_index: int):
         assert len(self.mamba_cache) > 0
@@ -747,25 +792,6 @@ class SambaForCausalLM(nn.Module, HasInnerState):
             if req_id in self.mamba_cache_indices_mapping:
                 self.mamba_cache_indices_mapping.pop(req_id)
 
-    def _get_mamba_cache_shape(
-            self
-    ) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
-        world_size = get_tensor_model_parallel_world_size()
-        hidden_size = self.config.hidden_size
-        # TODO: use hard-coded values for now
-        mamba_expand = 2
-        mamba_d_conv = 4
-        mamba_d_state = 16
-        conv_state_shape = (
-            mamba_expand * hidden_size // world_size,
-            mamba_d_conv - 1,
-        )
-        temporal_state_shape = (
-            mamba_expand * hidden_size // world_size,
-            mamba_d_state,
-        )
-        return conv_state_shape, temporal_state_shape
-
     def _prepare_mamba_cache(self):
         # dtype = self.lm_head.weight.dtype
         # TODO: hard-code
@@ -786,18 +812,3 @@ class SambaForCausalLM(nn.Module, HasInnerState):
                                         temporal_state_shape,
                                         dtype=dtype,
                                         device="cuda"))
-
-    def load_weights(
-        self,
-        weights: Iterable[Tuple[str, torch.Tensor]],
-    ):
-        weights = {name: weight for name, weight in weights}
-        # for name, loaded_weight in weights.items():
-        #     print(name, loaded_weight.shape)
-
-        # for name, param in self.named_parameters():
-        #     print(name, param.shape)
-        missing_keys, unexpected_keys = self.load_state_dict(weights, strict=False)
-        assert missing_keys == ['lm_head.weight'], f"Missing keys: {missing_keys}"
-        assert not unexpected_keys, f"Unexpected keys: {unexpected_keys}"
-        self.lm_head.weight.data.copy_(weights['model.embed_tokens.weight'])
