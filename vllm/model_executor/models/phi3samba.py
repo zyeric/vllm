@@ -43,6 +43,9 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType)
+from vllm.attention.ops.paged_attn import (PagedAttention,
+                                           PagedAttentionMetadata)
+from vllm.attention.backends.xformers import _get_seq_len_block_table_args
 
 
 class SambaMLP(nn.Module):
@@ -139,8 +142,37 @@ class SambaAttention(nn.Module):
             q = self.Wqkv(hidden_states)
             mock_k = torch.zeros_like(q)
             q, _ = self.rotary_emb(positions, q, mock_k)
-            print('>>>', attn_metadata.is_all_encoder_attn_metadata_set, attn_metadata.is_all_cross_attn_metadata_set)
-            attn_output = self.attn(q, None, None, kv_cache, attn_metadata, attn_type=AttentionType.ENCODER_DECODER)
+            key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache, self.num_key_value_heads, self.head_dim)
+            # print('>>>', q.shape, key_cache.shape, value_cache.shape)
+            # print('>>>', attn_metadata.prefill_metadata)
+            # print('>>>', attn_metadata.decode_metadata)
+
+            # use randn_like to make it e2e runnable temporarily
+            # should use empty_like instead
+            output = torch.randn_like(q)
+            # TODO: check these args and function call, bug exists
+            block_tables_arg = attn_metadata.block_tables
+            seq_lens_arg = attn_metadata.seq_lens_tensor
+            max_seq_len_arg = attn_metadata.max_decode_seq_len
+
+            query = q.view(-1, self.num_heads, self.head_dim)
+            # output = PagedAttention.forward_decode(
+            #     query,
+            #     key_cache,
+            #     value_cache,
+            #     block_tables_arg,
+            #     seq_lens_arg,
+            #     max_seq_len_arg,
+            #     self.attn.kv_cache_dtype,
+            #     self.num_key_value_heads,
+            #     self.head_dim**-0.5,
+            #     alibi_slopes=None,
+            #     k_scale=1.0,
+            #     v_scale=1.0,
+            # )
+            # print('>>>', output.shape)
+            attn_output = output.view(-1, q.size(-1))
+            # print('>>>', attn_output.shape, attn_output.dtype, self.out_proj.weight.dtype)
         return self.out_proj(attn_output)
 
 
@@ -452,18 +484,28 @@ class SambaModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        print('>>>', attn_metadata)
-        is_prefill = attn_metadata.max_decode_seq_len == 0
-        print('>>>', is_prefill)
+        # print('>>>', attn_metadata)
 
         kv_cache_idx = 0
         mamba_state_idx = 0
         for i, layer in enumerate(self.layers):
-            # no need to compute the last half of the layers in prefill for YOCO arch
-            if is_prefill and i >= self.config.num_hidden_layers // 2:
-                break
-
             print('>>>', i, layer.use_mamba, layer.yoco_cross)
+            if i == self.config.num_hidden_layers // 2 + 2:
+                # seems pre-run for cuda graph will not store kv_cache
+                if kv_caches[kv_cache_idx - 1].shape == torch.Size([0]):
+                    break
+                # print('>>>', kv_caches[kv_cache_idx - 1].shape)
+                # print('>>>', hidden_states.shape)
+
+                # if not equal, means we are in the prefill phase
+                if hidden_states.size(0) != attn_metadata.seq_lens_tensor.size(0):
+                    # seq_start_loc is for flash attn
+                    # need to compute it for xformers backend
+                    selected_token_indices = torch.cumsum(attn_metadata.seq_lens_tensor, dim=0) - 1
+                    # print('>>>', selected_token_indices)
+                    hidden_states = hidden_states.index_select(0, selected_token_indices)
+                    # print('>>>', hidden_states.shape)
+
             if layer.use_mamba:
                 hidden_states = layer(
                     hidden_states,
@@ -532,7 +574,8 @@ class SambaForCausalLM(nn.Module, HasInnerState):
 
         self.mamba_cache: Optional[MambaCacheManager] = None
         self.logits_processor = LogitsProcessor(config.vocab_size,
-                                                config.vocab_size)
+                                                config.vocab_size,
+                                                logits_as_input=False)
         self.sampler = Sampler()
 
     def forward(
@@ -599,9 +642,23 @@ class SambaForCausalLM(nn.Module, HasInnerState):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata, self.embedding_bias)
-        return logits
+        if hidden_states.size(0) == sampling_metadata.selected_token_indices.size(0):
+            # print('>>>', hidden_states.shape)
+            # print('>>>', hidden_states)
+            # we have manually selected tokens for YOCO at SambaModel's forward function
+            self.logits_processor.logits_as_input = True
+            # import traceback
+            # traceback.print_stack()
+            # print('>>>', hidden_states.shape)
+            logits = self.logits_processor._get_logits(hidden_states, self.lm_head, self.embedding_bias)
+            processed_logits = self.logits_processor(self.lm_head, logits,
+                                           sampling_metadata)
+            # print('*' * 50)
+            self.logits_processor.logits_as_input = False
+        else:
+            # the 1st profile run
+            processed_logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata, self.embedding_bias)
+        return processed_logits
 
     def sample(
         self,
