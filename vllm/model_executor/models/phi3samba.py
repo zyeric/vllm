@@ -48,6 +48,9 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
 from vllm.attention.backends.xformers import _get_seq_len_block_table_args
 
 
+PREFILL_BLOCK_TABLES = []
+
+
 class SambaMLP(nn.Module):
     """Gated Linear Unit.
 
@@ -144,35 +147,45 @@ class SambaAttention(nn.Module):
             q, _ = self.rotary_emb(positions, q, mock_k)
             key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache, self.num_key_value_heads, self.head_dim)
             # print('>>>', q.shape, key_cache.shape, value_cache.shape)
-            # print('>>>', attn_metadata.prefill_metadata)
-            # print('>>>', attn_metadata.decode_metadata)
+            # print('>>> prefill_metadata', attn_metadata.prefill_metadata)
+            # print('>>> decode_metadata', attn_metadata.decode_metadata)
 
             # use randn_like to make it e2e runnable temporarily
             # should use empty_like instead
             output = torch.randn_like(q)
-            # TODO: check these args and function call, bug exists
-            block_tables_arg = attn_metadata.block_tables
-            seq_lens_arg = attn_metadata.seq_lens_tensor
-            max_seq_len_arg = attn_metadata.max_decode_seq_len
+            # TODO: check these args and function call for parity
+            # means prefill?
+            if not attn_metadata.decode_metadata:
+                # print('>>>', PREFILL_BLOCK_TABLES)
+                block_tables_arg = torch.Tensor(PREFILL_BLOCK_TABLES).to(q.device).to(torch.int32)
+                seq_lens_arg = attn_metadata.seq_lens_tensor
+                # hard code for now
+                max_seq_len_arg = 4096
+            else:
+                block_tables_arg = attn_metadata.block_tables
+                seq_lens_arg = attn_metadata.seq_lens_tensor
+                max_seq_len_arg = attn_metadata.max_decode_seq_len
+            # print('>>> block_tables_arg', block_tables_arg)
+            # print('>>> seq_lens_arg', seq_lens_arg)
+            # print('>>> max_seq_len_arg', max_seq_len_arg)
 
             query = q.view(-1, self.num_heads, self.head_dim)
-            # output = PagedAttention.forward_decode(
-            #     query,
-            #     key_cache,
-            #     value_cache,
-            #     block_tables_arg,
-            #     seq_lens_arg,
-            #     max_seq_len_arg,
-            #     self.attn.kv_cache_dtype,
-            #     self.num_key_value_heads,
-            #     self.head_dim**-0.5,
-            #     alibi_slopes=None,
-            #     k_scale=1.0,
-            #     v_scale=1.0,
-            # )
-            # print('>>>', output.shape)
+            # seems we cannot use the wrapped flash-attn backend here
+            output = PagedAttention.forward_decode(
+                query,
+                key_cache,
+                value_cache,
+                block_tables_arg,
+                seq_lens_arg,
+                max_seq_len_arg,
+                self.attn.kv_cache_dtype,
+                self.num_key_value_heads,
+                self.head_dim**-0.5,
+                alibi_slopes=None,
+                k_scale=1.0,
+                v_scale=1.0,
+            )
             attn_output = output.view(-1, q.size(-1))
-            # print('>>>', attn_output.shape, attn_output.dtype, self.out_proj.weight.dtype)
         return self.out_proj(attn_output)
 
 
@@ -484,12 +497,13 @@ class SambaModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
+        # print('>>> one step')
         # print('>>>', attn_metadata)
 
         kv_cache_idx = 0
         mamba_state_idx = 0
         for i, layer in enumerate(self.layers):
-            print('>>>', i, layer.use_mamba, layer.yoco_cross)
+            # print('>>>', i, layer.use_mamba, layer.yoco_cross)
             if i == self.config.num_hidden_layers // 2 + 2:
                 # seems pre-run for cuda graph will not store kv_cache
                 if kv_caches[kv_cache_idx - 1].shape == torch.Size([0]):
