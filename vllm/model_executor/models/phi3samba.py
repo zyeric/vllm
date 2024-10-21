@@ -152,8 +152,7 @@ class SambaAttention(nn.Module):
 
             # use randn_like to make it e2e runnable temporarily
             # should use empty_like instead
-            output = torch.randn_like(q)
-            # TODO: check these args and function call for parity
+            output = torch.empty_like(q)
             # means prefill?
             if not attn_metadata.decode_metadata:
                 # print('>>>', PREFILL_BLOCK_TABLES)
@@ -171,6 +170,7 @@ class SambaAttention(nn.Module):
 
             query = q.view(-1, self.num_heads, self.head_dim)
             # seems we cannot use the wrapped flash-attn backend here
+            # TODO: check these args and function call for parity
             output = PagedAttention.forward_decode(
                 query,
                 key_cache,
@@ -269,17 +269,24 @@ class Phi3Mamba(nn.Module):
                                             skip_bias_add=True,
                                             params_dtype=dtype)
 
-        # S4D real initialization
-        A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32),
-            "n -> d n",
-            d=self.d_inner,
-        ).contiguous()
-        A_log = torch.log(A)  # Keep A_log in fp32
-        self.A_log = nn.Parameter(A_log)
+        # # S4D real initialization
+        # A = repeat(
+        #     torch.arange(1, self.d_state + 1, dtype=torch.float32),
+        #     "n -> d n",
+        #     d=self.d_inner,
+        # ).contiguous()
+        # A_log = torch.log(A)  # Keep A_log in fp32
+        # self.A_log = nn.Parameter(A_log)
 
-        # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.d_inner))  # Keep in fp32
+        # # D "skip" parameter
+        # self.D = nn.Parameter(torch.ones(self.d_inner))  # Keep in fp32
+        self.A = nn.Parameter(
+            torch.empty(
+                self.d_inner,
+                self.d_state,
+                dtype=torch.float32,
+            ))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.out_proj = RowParallelLinear(
@@ -298,7 +305,6 @@ class Phi3Mamba(nn.Module):
             attn_metadata: AttentionMetadata,
             mamba_cache_params: MambaCacheParams,
         ) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
 
         # 1. Gated MLP's linear projection
         # projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
@@ -359,7 +365,7 @@ class Phi3Mamba(nn.Module):
                 hidden_states,
                 mamba_cache_params.ssm_state,
                 discrete_time_step,
-                self.A_log,
+                self.A,
                 B.transpose(-2, -1),
                 C.transpose(-2, -1),
                 self.D.float(),
@@ -374,7 +380,7 @@ class Phi3Mamba(nn.Module):
                 mamba_cache_params.ssm_state,
                 hidden_states.transpose(0, 1),
                 discrete_time_step.transpose(0, 1),
-                self.A_log,
+                self.A,
                 B,
                 C,
                 self.D,
@@ -388,7 +394,6 @@ class Phi3Mamba(nn.Module):
         contextualized_states = self.out_proj(scan_outputs.transpose(-2,
                                                                      -1))[0]
 
-        contextualized_states = contextualized_states.to(input_dtype)
         return contextualized_states
 
 
@@ -438,12 +443,14 @@ class SambaDecoderLayer(nn.Module):
         residual = hidden_states
         # why need to cast here?
         hidden_states = self.input_layernorm(hidden_states.to(dtype=self.input_layernorm.weight.dtype))
+
         if self.use_mamba:
             attn_outputs = self.attn(
                 hidden_states,
                 attn_metadata,
                 mamba_cache_params,
             )
+            residual = residual.to(torch.float32)
         else:
             attn_outputs = self.attn(
                 hidden_states,
@@ -503,7 +510,6 @@ class SambaModel(nn.Module):
         kv_cache_idx = 0
         mamba_state_idx = 0
         for i, layer in enumerate(self.layers):
-            # print('>>>', i, layer.use_mamba, layer.yoco_cross)
             if i == self.config.num_hidden_layers // 2 + 2:
                 # seems pre-run for cuda graph will not store kv_cache
                 if kv_caches[kv_cache_idx - 1].shape == torch.Size([0]):
@@ -550,7 +556,7 @@ class SambaModel(nn.Module):
                     None,
                 )
 
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states = self.final_layernorm(hidden_states.to(dtype=self.final_layernorm.weight.dtype))
         return hidden_states
 
 
@@ -687,13 +693,19 @@ class SambaForCausalLM(nn.Module, HasInnerState):
         weights: Iterable[Tuple[str, torch.Tensor]],
     ):
         weights = {name: weight for name, weight in weights}
+        adjusted_weights = {}
+        for name, weight in weights.items():
+            if "A_log" in name:
+                name = name.replace("A_log", "A")
+                weight = -torch.exp(weight.float())
+            adjusted_weights[name] = weight
         # for name, loaded_weight in weights.items():
         #     print(name, loaded_weight.shape)
 
         # for name, param in self.named_parameters():
         #     print(name, param.shape)
-        missing_keys, unexpected_keys = self.load_state_dict(weights, strict=False)
+        missing_keys, unexpected_keys = self.load_state_dict(adjusted_weights, strict=False)
         assert missing_keys == ['embedding_bias', 'lm_head.weight',], f"Missing keys: {missing_keys}"
         assert unexpected_keys == ['lm_head.bias',], f"Unexpected keys: {unexpected_keys}"
-        self.lm_head.weight.data.copy_(weights['model.embed_tokens.weight'])
-        self.embedding_bias.data.copy_(weights['lm_head.bias'])
+        self.lm_head.weight.data.copy_(adjusted_weights['model.embed_tokens.weight'])
+        self.embedding_bias.data.copy_(adjusted_weights['lm_head.bias'])
