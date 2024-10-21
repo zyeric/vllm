@@ -121,6 +121,7 @@ class SambaAttention(nn.Module):
             base=self.rope_theta,
         )
         # TODO: add sliding window
+        assert self.config.attention_dropout == 0.0, 'Attention dropout is not supported for now'
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -170,7 +171,6 @@ class SambaAttention(nn.Module):
 
             query = q.view(-1, self.num_heads, self.head_dim)
             # seems we cannot use the wrapped flash-attn backend here
-            # TODO: check these args and function call for parity
             output = PagedAttention.forward_decode(
                 query,
                 key_cache,
@@ -441,7 +441,6 @@ class SambaDecoderLayer(nn.Module):
             assert kv_cache is not None and mamba_cache_params is None
 
         residual = hidden_states
-        # why need to cast here?
         hidden_states = self.input_layernorm(hidden_states.to(dtype=self.input_layernorm.weight.dtype))
 
         if self.use_mamba:
@@ -491,7 +490,6 @@ class SambaModel(nn.Module):
             [SambaDecoderLayer(config, layer_idx, cache_config) for layer_idx in range(config.num_hidden_layers)]
         )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # TODO
 
     def forward(
         self,
@@ -607,7 +605,6 @@ class SambaForCausalLM(nn.Module, HasInnerState):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        # print(attn_metadata)
         if self.mamba_cache is None:
             max_batch_size = _get_graph_batch_size(
                 self.scheduler_config.max_num_seqs) if self.scheduler_config else \
@@ -631,9 +628,7 @@ class SambaForCausalLM(nn.Module, HasInnerState):
                                    attn_metadata, mamba_cache_params)
         return hidden_states
 
-    def _get_mamba_cache_shape(
-            self
-    ) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    def _get_mamba_cache_shape(self) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
         world_size = get_tensor_model_parallel_world_size()
         hidden_size = self.config.hidden_size
         # TODO: use hard-coded values for now
