@@ -317,6 +317,8 @@ class FlashAttentionMetadataBuilder(
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
 
+        # hack for YOCO
+        import vllm.model_executor.models.phi3samba as YOCO
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block) in zip(
                  inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
@@ -350,6 +352,16 @@ class FlashAttentionMetadataBuilder(
                     block_table = block_tables[seq_id][
                         -curr_sliding_window_block:]
             self.block_tables.append(block_table)
+            yoco_block_table = []
+            if prefix_cache_hit:
+                yoco_block_table = block_tables[seq_id]
+            elif block_tables is not None:
+                if curr_sliding_window_block == 0:
+                    yoco_block_table = block_tables[seq_id]
+                else:
+                    yoco_block_table = block_tables[seq_id][
+                        -curr_sliding_window_block:]
+            YOCO.PREFILL_BLOCK_TABLES.append(yoco_block_table)
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -399,6 +411,8 @@ class FlashAttentionMetadataBuilder(
             inter_data.prefix_cache_hit
             for inter_data in self.input_builder.inter_data_list
         ])
+        import vllm.model_executor.models.phi3samba as YOCO
+        YOCO.PREFILL_BLOCK_TABLES = []
         for inter_data in self.input_builder.inter_data_list:
             self._add_seq_group(inter_data,
                                 self.input_builder.chunked_prefill_enabled,
