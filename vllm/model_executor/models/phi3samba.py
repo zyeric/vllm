@@ -120,14 +120,18 @@ class SambaAttention(nn.Module):
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
         )
-        # TODO: add sliding window
         assert self.config.attention_dropout == 0.0, 'Attention dropout is not supported for now'
+        # TODO: double check sliding window
+        new_cache_config = copy.deepcopy(cache_config)
+        # disable sliding window for the second half of the model
+        if layer_idx >= config.num_hidden_layers // 2:
+            new_cache_config.sliding_window = None
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
             num_kv_heads=self.num_key_value_heads,
-            cache_config=cache_config,
+            cache_config=new_cache_config,
         )
 
     def forward(
