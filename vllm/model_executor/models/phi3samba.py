@@ -145,7 +145,10 @@ class SambaAttention(nn.Module):
             qkv = self.Wqkv(hidden_states)
             q, k, v = qkv.split([self.hidden_size, self.num_key_value_heads * self.head_dim, self.num_key_value_heads * self.head_dim], dim=-1)
             q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+            if self.layer_idx < self.config.num_hidden_layers // 2:
+                attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+            else:
+                attn_output = self.attn(q, k, v, kv_cache, attn_metadata, AttentionType.DECODER_DECODER)
         else:
             q = self.Wqkv(hidden_states)
             mock_k = torch.zeros_like(q)
@@ -166,7 +169,7 @@ class SambaAttention(nn.Module):
                 # hard code for now
                 max_seq_len_arg = 4096
             else:
-                block_tables_arg = attn_metadata.block_tables
+                block_tables_arg = attn_metadata.yoco_block_tables
                 seq_lens_arg = attn_metadata.seq_lens_tensor
                 max_seq_len_arg = attn_metadata.max_decode_seq_len
             # print('>>> block_tables_arg', block_tables_arg)

@@ -57,6 +57,9 @@ from vllm.worker.model_runner_base import (
     _add_sampling_metadata_broadcastable_dict,
     _init_attn_metadata_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict, dump_input_when_exception)
+from vllm.attention.selector import (_Backend, get_env_variable_attn_backend,
+                                     get_global_forced_attn_backend,
+                                     global_force_attn_backend)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -209,6 +212,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             seq_ids: List[int],
             is_prompt: bool,
             block_tables: Optional[Dict[int, List[int]]],
+            yoco_block_tables: Optional[Dict[int, List[int]]],
             computed_block_nums: List[int],
             n_seqs: int = 0,
 
@@ -258,6 +262,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.request_id = request_id
             self.is_prompt = is_prompt
             self.block_tables = block_tables
+            self.yoco_block_tables = yoco_block_tables
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
@@ -388,6 +393,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             seq_ids=[0] * num_seqs,
             is_prompt=True,
             block_tables=None,
+            yoco_block_tables=None,
             computed_block_nums=[])
 
     def init_cached_inter_data(self, *args, **kwargs):
@@ -697,6 +703,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             seq_ids=seq_ids,
             is_prompt=is_prompt,
             block_tables=seq_group_metadata.block_tables,
+            yoco_block_tables=seq_group_metadata.yoco_block_tables,
             computed_block_nums=seq_group_metadata.computed_block_nums,
             reinit=True,
             reinit_use_defaults=True,
@@ -1009,6 +1016,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         needs_attn_backend = (num_attn_heads != 0
                               or self.model_config.is_attention_free)
 
+        global_force_attn_backend(_Backend.XFORMERS)
+
         self.attn_backend = get_attn_backend(
             self.model_config.get_head_size(),
             self.model_config.dtype,
@@ -1265,6 +1274,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 seq_data={group_id: seq_data},
                 sampling_params=sampling_params,
                 block_tables=None,
+                yoco_block_tables=None,
                 lora_request=dummy_lora_requests_per_seq[group_id]
                 if dummy_lora_requests_per_seq else None,
                 multi_modal_data=dummy_multi_modal_data,

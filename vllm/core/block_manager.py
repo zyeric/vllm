@@ -98,6 +98,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         )
 
         self.block_tables: Dict[SeqId, BlockTable] = {}
+        self.yoco_block_tables: Dict[SeqId, BlockTable] = {}
         self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
 
         self._computed_blocks_tracker = ComputedBlocksTracker(
@@ -144,11 +145,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         else:
             return AllocStatus.LATER
 
-    def _allocate_sequence(self, seq: Sequence) -> BlockTable:
+    def _allocate_sequence(self, seq: Sequence, is_yoco=False) -> BlockTable:
         block_table = BlockTable(
             block_size=self.block_size,
             block_allocator=self.block_allocator,
-            max_block_sliding_window=self.max_block_sliding_window,
+            # max_block_sliding_window=self.max_block_sliding_window,
+            max_block_sliding_window=None if is_yoco else self.max_block_sliding_window,
         )
         if seq.get_token_ids():
             # Add blocks to the block table only if the sequence is non empty.
@@ -167,7 +169,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # prompt.
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
+        yoco_block_table: BlockTable = self._allocate_sequence(seq, is_yoco=True)
         self.block_tables[seq.seq_id] = block_table
+        self.yoco_block_tables[seq.seq_id] = yoco_block_table
 
         # Track seq
         self._computed_blocks_tracker.add_seq(seq.seq_id)
@@ -176,6 +180,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Assign the block table for each sequence.
         for seq in waiting_seqs[1:]:
             self.block_tables[seq.seq_id] = block_table.fork()
+            self.yoco_block_tables[seq.seq_id] = yoco_block_table.fork()
 
             # Track seq
             self._computed_blocks_tracker.add_seq(seq.seq_id)
@@ -241,6 +246,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             num_lookahead_slots=num_lookahead_slots,
             num_computed_slots=seq.data.get_num_computed_tokens(),
         )
+
+        yoco_block_table = self.yoco_block_tables[seq.seq_id]
+        yoco_block_table.append_token_ids(
+            token_ids=yoco_block_table.get_unseen_token_ids(seq.get_token_ids()),
+            num_lookahead_slots=num_lookahead_slots,
+            num_computed_slots=seq.data.get_num_computed_tokens(),
+        )
         # Return any new copy-on-writes.
         new_cows = self.block_allocator.clear_copy_on_writes()
         return new_cows
@@ -263,6 +275,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Free table/blocks
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
+        self.yoco_block_tables[seq_id].free()
+        del self.yoco_block_tables[seq_id]
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
@@ -275,6 +289,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def get_block_table(self, seq: Sequence) -> List[int]:
         block_ids = self.block_tables[seq.seq_id].physical_block_ids
         return block_ids  # type: ignore
+
+    def get_yoco_block_table(self, seq: Sequence) -> List[int]:
+        block_ids = self.yoco_block_tables[seq.seq_id].physical_block_ids
+        return block_ids
 
     def get_cross_block_table(self, seq_group: SequenceGroup) -> List[int]:
         request_id = seq_group.request_id

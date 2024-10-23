@@ -20,6 +20,7 @@ class AttentionType(Enum):
     ENCODER_ONLY = auto()  # Encoder attention between previous layer Q/K/V
     ENCODER_DECODER = auto(
     )  # Attention between dec. Q and enc. K/V for encoder-decoder
+    DECODER_DECODER = auto() # YOCO
 
 
 class AttentionBackend(ABC):

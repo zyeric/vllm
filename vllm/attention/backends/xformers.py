@@ -147,6 +147,9 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
 
+    yoco_slot_mapping: Optional[torch.Tensor] = None
+    yoco_block_tables: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         # Set during the execution of the first attention op.
         # It is a list because it is needed to set per prompt
@@ -197,6 +200,8 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
                            self.query_start_loc[:self.num_prefills + 1])
         slot_mapping = (None if self.slot_mapping is None else
                         self.slot_mapping[:self.num_prefill_tokens])
+        yoco_slot_mapping = (None if self.yoco_slot_mapping is None else
+                                self.yoco_slot_mapping[:self.num_prefill_tokens])
         seq_lens = (None if self.seq_lens is None else
                     self.seq_lens[:self.num_prefills])
         seq_lens_tensor = (None if self.seq_lens_tensor is None else
@@ -205,6 +210,8 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
                                self.context_lens_tensor[:self.num_prefills])
         block_tables = (None if self.block_tables is None else
                         self.block_tables[:self.num_prefills])
+        yoco_block_tables = (None if self.yoco_block_tables is None else
+                                self.yoco_block_tables[:self.num_prefills])
 
         # Construct & cache prefill-phase attention metadata structure
         self._cached_prefill_metadata = XFormersMetadata(
@@ -221,6 +228,8 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=False,
+            yoco_slot_mapping=yoco_slot_mapping,
+            yoco_block_tables=yoco_block_tables,
             # Begin encoder & cross attn fields below...
             encoder_seq_lens=self.encoder_seq_lens,
             encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
@@ -244,10 +253,14 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
         # Compute some attn_metadata fields which default to None
         slot_mapping = (None if self.slot_mapping is None else
                         self.slot_mapping[self.num_prefill_tokens:])
+        yoco_slot_mapping = (None if self.yoco_slot_mapping is None else
+                                self.yoco_slot_mapping[self.num_prefill_tokens:])
         seq_lens_tensor = (None if self.seq_lens_tensor is None else
                            self.seq_lens_tensor[self.num_prefills:])
         block_tables = (None if self.block_tables is None else
                         self.block_tables[self.num_prefills:])
+        yoco_block_tables = (None if self.yoco_block_tables is None else
+                                self.yoco_block_tables[self.num_prefills:])
 
         # Construct & cache decode-phase attention metadata structure
         self._cached_decode_metadata = XFormersMetadata(
@@ -260,6 +273,8 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
             max_decode_seq_len=self.max_decode_seq_len,
             block_tables=block_tables,
             use_cuda_graph=self.use_cuda_graph,
+            yoco_slot_mapping=yoco_slot_mapping,
+            yoco_block_tables=yoco_block_tables,
             # Begin encoder & cross attn fields below...
             encoder_seq_lens=self.encoder_seq_lens,
             encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
@@ -288,7 +303,7 @@ def _get_attn_bias(
     '''
 
     if (attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY):
+            or attn_type == AttentionType.ENCODER_ONLY or attn_type == AttentionType.DECODER_DECODER):
         return attn_metadata.attn_bias
     elif attn_type == AttentionType.ENCODER:
         return attn_metadata.encoder_attn_bias
@@ -355,15 +370,19 @@ def _get_seq_len_block_table_args(
     * Appropriate block tables (or None)
     '''
 
-    if attn_type == AttentionType.DECODER:
+    if attn_type == AttentionType.DECODER or attn_type == AttentionType.DECODER_DECODER:
         # Decoder self-attention
         # Choose max_seq_len based on whether we are in prompt_run
         if is_prompt:
             max_seq_len = attn_metadata.max_prefill_seq_len
         else:
             max_seq_len = attn_metadata.max_decode_seq_len
-        return (attn_metadata.seq_lens_tensor, max_seq_len,
-                attn_metadata.block_tables)
+        if attn_type == AttentionType.DECODER_DECODER:
+            return (attn_metadata.seq_lens_tensor, max_seq_len,
+                    attn_metadata.yoco_block_tables)
+        else:
+            return (attn_metadata.seq_lens_tensor, max_seq_len,
+                    attn_metadata.block_tables)
     elif attn_type == AttentionType.ENCODER_DECODER:
         # Enc/dec cross-attention KVs match encoder sequence length;
         # cross-attention utilizes special "cross" block tables
@@ -558,6 +577,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     # During cross-attention decode, key & value will be None,
                     # preventing this IF-statement branch from running
                     updated_slot_mapping = attn_metadata.cross_slot_mapping
+                elif attn_type == AttentionType.DECODER_DECODER:
+                    updated_slot_mapping = attn_metadata.yoco_slot_mapping
                 else:
                     # Update self-attention KV cache (prefill/decode)
                     updated_slot_mapping = attn_metadata.slot_mapping

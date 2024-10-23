@@ -119,9 +119,11 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.slot_mapping: List[int] = []
+        self.yoco_slot_mapping: List[int] = []
         self.prefill_seq_lens: List[int] = []
         self.context_lens: List[int] = []
         self.block_tables: List[List[int]] = []
+        self.yoco_block_tables: List[List[int]] = []
         self.curr_seq_lens: List[int] = []
         self.num_prefills = 0
         self.num_prefill_tokens = 0
@@ -138,6 +140,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             chunked_prefill_enabled: bool):
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
+        yoco_block_tables = inter_data.yoco_block_tables
         computed_block_nums = inter_data.computed_block_nums
 
         # hack for YOCO
@@ -165,18 +168,23 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
+            yoco_block_table = []
             if inter_data.prefix_cache_hit:
                 block_table = computed_block_nums
+                yoco_block_table = computed_block_nums
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 block_table = block_tables[seq_id][-curr_sliding_window_block:]
+                yoco_block_table = yoco_block_tables[seq_id]
             self.block_tables.append(block_table)
-            yoco_block_table = []
+            self.yoco_block_tables.append(yoco_block_table)
+
+            cross_yoco_block_table = []
             if inter_data.prefix_cache_hit:
-                yoco_block_table = computed_block_nums
+                cross_yoco_block_table = computed_block_nums
             elif block_tables is not None:
-                yoco_block_table = block_tables[seq_id][-curr_sliding_window_block:]
-            YOCO.PREFILL_BLOCK_TABLES.append(yoco_block_table)
+                cross_yoco_block_table = yoco_block_tables[seq_id]
+            YOCO.PREFILL_BLOCK_TABLES.append(cross_yoco_block_table)
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -186,6 +194,12 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
                                  seq_len, context_len, start_idx,
                                  self.block_size, inter_data.block_tables)
+            start_idx = compute_slot_mapping_start_idx(is_prompt, query_len,
+                                                       context_len,
+                                                       None)
+            compute_slot_mapping(is_profile_run, self.yoco_slot_mapping, seq_id,
+                                 seq_len, context_len, start_idx,
+                                 self.block_size, inter_data.yoco_block_tables)
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):
@@ -213,6 +227,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
         num_decode_tokens = self.num_decode_tokens
 
         if use_captured_graph:
+            assert False, "Not implemented"
             self.slot_mapping.extend([PAD_SLOT_ID] * cuda_graph_pad_size)
             self.block_tables.extend([] * cuda_graph_pad_size)
             num_decode_tokens = batch_size
@@ -232,6 +247,12 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
                 dtype=torch.int,
                 device=device,
             )
+            yoco_block_tables = make_tensor_with_pad(
+                self.yoco_block_tables,
+                pad=0,
+                dtype=torch.int,
+                device=device,
+            )
         assert max_query_len > 0, "query_lens: {}".format(query_lens)
 
         assert device is not None
@@ -243,6 +264,9 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
                                              self.runner.pin_memory)
         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
                                                device, self.runner.pin_memory)
+        yoco_slot_mapping_tensor = async_tensor_h2d(self.yoco_slot_mapping,
+                                                    torch.long, device,
+                                                    self.runner.pin_memory)
         query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
                                       dtype=torch.int32,
                                       device=device)
@@ -258,9 +282,11 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
                      dtype=query_start_loc.dtype,
                      out=query_start_loc[1:])
 
+        # TODO: refine here
         return self._metadata_cls(  # type: ignore
             num_prefills=self.num_prefills,
             slot_mapping=slot_mapping_tensor,
+            yoco_slot_mapping=yoco_slot_mapping_tensor,
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=num_decode_tokens,
             seq_lens=seq_lens,
@@ -272,6 +298,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             seq_start_loc=seq_start_loc,
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
+            yoco_block_tables=yoco_block_tables,
             use_cuda_graph=use_captured_graph,
         )
 
