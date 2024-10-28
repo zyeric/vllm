@@ -97,10 +97,19 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             block_size=block_size,
         )
 
+        import vllm.model_executor.models.phi3samba as YOCO
+        self.yoco_block_allocator = CpuGpuBlockAllocator.create(
+            allocator_type="prefix_caching" if enable_caching else "naive",
+            num_gpu_blocks=YOCO.NUM_YOCO_GPU_BLOCKS,
+            num_cpu_blocks=num_cpu_blocks,
+            block_size=block_size,
+        )
+
         self.block_tables: Dict[SeqId, BlockTable] = {}
         self.yoco_block_tables: Dict[SeqId, BlockTable] = {}
         self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
 
+        # TODO: check usage of these trackers
         self._computed_blocks_tracker = ComputedBlocksTracker(
             self.block_allocator)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
@@ -148,7 +157,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def _allocate_sequence(self, seq: Sequence, is_yoco=False) -> BlockTable:
         block_table = BlockTable(
             block_size=self.block_size,
-            block_allocator=self.block_allocator,
+            block_allocator=self.yoco_block_allocator if is_yoco else self.block_allocator,
             # max_block_sliding_window=self.max_block_sliding_window,
             max_block_sliding_window=None if is_yoco else self.max_block_sliding_window,
         )

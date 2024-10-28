@@ -82,6 +82,16 @@ class CacheEngine:
                             dtype=self.dtype,
                             pin_memory=pin_memory,
                             device=device))
+        # hardcode for now
+        import vllm.model_executor.models.phi3samba as YOCO
+        sa_kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+            YOCO.NUM_YOCO_GPU_BLOCKS, self.block_size, self.num_kv_heads, self.head_size)
+        for _ in range(2):
+            kv_cache.append(
+                torch.zeros(sa_kv_cache_shape,
+                            dtype=self.dtype,
+                            pin_memory=pin_memory,
+                            device=device))
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:

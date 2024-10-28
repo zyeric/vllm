@@ -49,6 +49,7 @@ from vllm.attention.backends.xformers import _get_seq_len_block_table_args
 
 
 PREFILL_BLOCK_TABLES = []
+NUM_YOCO_GPU_BLOCKS = 0
 
 
 class SambaMLP(nn.Module):

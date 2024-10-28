@@ -246,12 +246,22 @@ class Worker(LocalOrDistributedWorkerBase):
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
+        # NOTE: we have changed the `layers_block_type` in the configuration file
+        # so that only the #SWA layers are returned. For the default config, there
+        # are 8 SWA layers, 8 mamba layers, 2 full attention layers and 14 yoco
+        # cross attention layers.
         cache_block_size = self.get_cache_block_size_bytes()
+        logger.info(f"cache_block_size: {cache_block_size}")
+        # we allocate the memory in a 1:4 ratio heuristically
+        swa_kv_cache_memory = available_kv_cache_memory // 5
+        sa_kv_cache_memory = available_kv_cache_memory - swa_kv_cache_memory
+        import vllm.model_executor.models.phi3samba as YOCO
         if cache_block_size == 0:
             num_gpu_blocks = 0
             num_cpu_blocks = 0
         else:
-            num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
+            num_gpu_blocks = int(swa_kv_cache_memory // cache_block_size)
+            YOCO.NUM_YOCO_GPU_BLOCKS = int(sa_kv_cache_memory // cache_block_size)
             num_cpu_blocks = int(self.cache_config.swap_space_bytes //
                                  cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
