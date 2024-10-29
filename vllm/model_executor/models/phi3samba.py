@@ -167,8 +167,8 @@ class SambaAttention(nn.Module):
                 # print('>>>', PREFILL_BLOCK_TABLES)
                 block_tables_arg = torch.Tensor(PREFILL_BLOCK_TABLES).to(q.device).to(torch.int32)
                 seq_lens_arg = attn_metadata.seq_lens_tensor
-                # hard code for now
-                max_seq_len_arg = 4096
+                # TODO: verify this val
+                max_seq_len_arg = seq_lens_arg.max().item()
             else:
                 block_tables_arg = attn_metadata.yoco_block_tables
                 seq_lens_arg = attn_metadata.seq_lens_tensor
