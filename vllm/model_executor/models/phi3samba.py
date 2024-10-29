@@ -532,6 +532,9 @@ class SambaModel(nn.Module):
                     hidden_states = hidden_states.index_select(0, selected_token_indices)
                     # print('>>>', hidden_states.shape)
 
+            # start_env = torch.cuda.Event(enable_timing=True)
+            # end_env = torch.cuda.Event(enable_timing=True)
+            # start_env.record()
             if layer.use_mamba:
                 hidden_states = layer(
                     hidden_states,
@@ -561,6 +564,9 @@ class SambaModel(nn.Module):
                     attn_metadata,
                     None,
                 )
+            # end_env.record()
+            # torch.cuda.synchronize()
+            # print('>>> layer', i, 'time', start_env.elapsed_time(end_env))
 
         hidden_states = self.final_layernorm(hidden_states.to(dtype=self.final_layernorm.weight.dtype))
         return hidden_states
