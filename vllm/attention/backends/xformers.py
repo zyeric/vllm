@@ -159,6 +159,7 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
         self.attn_bias: Optional[List[AttentionBias]] = None
         self.encoder_attn_bias: Optional[List[AttentionBias]] = None
         self.cross_attn_bias: Optional[List[AttentionBias]] = None
+        self.yoco_attn_bias: Optional[List[AttentionBias]] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -303,12 +304,14 @@ def _get_attn_bias(
     '''
 
     if (attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY or attn_type == AttentionType.DECODER_DECODER):
+            or attn_type == AttentionType.ENCODER_ONLY):
         return attn_metadata.attn_bias
     elif attn_type == AttentionType.ENCODER:
         return attn_metadata.encoder_attn_bias
     elif attn_type == AttentionType.ENCODER_DECODER:
         return attn_metadata.cross_attn_bias
+    elif attn_type == AttentionType.DECODER_DECODER:
+        return attn_metadata.yoco_attn_bias
     else:
         raise AttributeError(f"Invalid attention type {str(attn_type)}")
 
@@ -337,6 +340,8 @@ def _set_attn_bias(
         attn_metadata.encoder_attn_bias = attn_bias
     elif attn_type == AttentionType.ENCODER_DECODER:
         attn_metadata.cross_attn_bias = attn_bias
+    elif attn_type == AttentionType.DECODER_DECODER:
+        attn_metadata.yoco_attn_bias = attn_bias
     else:
         raise AttributeError(f"Invalid attention type {str(attn_type)}")
 
@@ -780,7 +785,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
                 # Self-attention block of decoder branch just
                 # uses the seq_lens directly
-                elif attn_type == AttentionType.DECODER:
+                elif attn_type == AttentionType.DECODER or attn_type == AttentionType.DECODER_DECODER:
                     assert attn_metadata.seq_lens is not None
 
                     # Decoder self-attention mask is causal
