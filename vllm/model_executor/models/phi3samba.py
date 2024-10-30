@@ -242,7 +242,6 @@ class Phi3Mamba(nn.Module):
             input_size=d_conv,
             output_size=self.d_inner,
             bias=conv_bias,
-            params_dtype=dtype,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -254,7 +253,7 @@ class Phi3Mamba(nn.Module):
         self.in_proj = MergedColumnParallelLinear(self.d_model,
                                                   [self.d_inner] * 2,
                                                   bias=bias,
-                                                  params_dtype=dtype)
+                                                 )
 
         # self.x_proj = nn.Linear(
         #     self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
@@ -264,7 +263,6 @@ class Phi3Mamba(nn.Module):
             self.d_inner,
             self.dt_rank + self.d_state * 2,
             bias=False,
-            params_dtype=dtype,
         )
 
         # self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
@@ -275,7 +273,7 @@ class Phi3Mamba(nn.Module):
                                             self.d_inner,
                                             bias=True,
                                             skip_bias_add=True,
-                                            params_dtype=dtype)
+                                        )
 
         # # S4D real initialization
         # A = repeat(
@@ -302,7 +300,6 @@ class Phi3Mamba(nn.Module):
             self.d_model,
             bias=bias,
             input_is_parallel=True,
-            params_dtype=dtype,
         )
 
         self.activation = "silu"
@@ -624,7 +621,7 @@ class SambaForCausalLM(nn.Module, HasInnerState):
                 self.scheduler_config.max_num_seqs) if self.scheduler_config else \
                 max(_BATCH_SIZES_TO_CAPTURE) + 2
             self.mamba_cache = MambaCacheManager(
-                torch.float32, self.config.num_hidden_layers // 2 // self.config.mb_per_layer,
+                self.lm_head.weight.dtype, self.config.num_hidden_layers // 2 // self.config.mb_per_layer,
                 max_batch_size, *self._get_mamba_cache_shape()
             )
 
